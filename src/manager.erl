@@ -1,14 +1,9 @@
--module(manager_mnesia).
+-module(manager).
 -behaviour(gen_server).
 -include_lib("stdlib/include/qlc.hrl").
 
 -define(SERVER, ?MODULE).
 -record(state, { order_queue=queue:new() }).
--record(vehicle, {
-          id, type, capacity, speed, % 100 unit/second
-          location, loaded_weight, order_ids,
-          from=none, to=none, distance_to_destination=none
-         }).
 -record(order, {
           order_id, from, to, location, weight,
           owner_pid, reserve_status, deliver_status, vehicle_id, timestamp
@@ -18,7 +13,8 @@
          build_init_state/0, build_order/10, build_new_order/6,
          init/1, handle_call/3, do/1, all_orders/0, put_order/4,
          unreserved_orders/1, sort_orders_by_time/1, query_orders/2,
-         reserve_action_by/3
+         reserve_action_by/3, is_hub/2, transit_order/1, start_in_shell_for_testing/0,
+         handle_cast/2, handle_info/2,  terminate/2, code_change/3, stop/1
         ]).
 % Export APIs
 -export([start_link/0, send/3, pickup/1, reserve/3, load/1, dropoff/1, 
@@ -27,6 +23,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%       Public APIs        %%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 %% @doc start manager server, connect to database
 - spec start_link() -> {ok, pid()}.
 start_link() ->
@@ -63,7 +60,6 @@ load(Ref) ->
 dropoff(Ref) -> 
     gen_server:call(?SERVER, {dropoff, Ref}).
 
-%% 
 %% @doc put an order to a hub.
 - spec transit(Ref :: integer(), Loc :: string()) -> ok | {error, not_picked | instance}.
 transit(Ref, Loc) -> 
@@ -96,49 +92,63 @@ handle_call({pickup, Loc}, _From, State) ->
 
 %% reserve: dequeue order queue until weights sums to Kg.
 %% Mark orders as reserved by this Pid/Id
-%% TODO: need a vehicle registey in case vehicle process pid changed
+%% vehicle process pid changed won't affect Id
 handle_call({reserve, From, To, Kg}, FromPid, State) -> 
+    {Pid, _Ref} = FromPid,
+    Id = get_pid_name(Pid),
     Orders = sort_orders_by_time(query_orders(From, To)),
-    SelecteIds = lists:foldl(fun(Elem, {Select, Sum}) -> 
-                                     W = Elem#order.weight,
-                                     if (W + Sum) > Kg -> {Select, Sum};
-                                        true -> {[Elem#order.order_id | Select], Sum+W}
-                                     end
-                             end, {[], 0}, Orders),
+    { SelecteIds, _ } = lists:foldl(fun(Elem, {Select, Sum}) -> 
+                                            W = Elem#order.weight,
+                                            ReserveStatus = Elem#order.reserve_status,
+                                            case ReserveStatus of 
+                                                reserved -> {Select, Sum};
+                                                _ -> if
+                                                         (W + Sum) > Kg -> {Select, Sum};
+                                                         true -> {[Elem#order.order_id | Select], Sum+W}
+                                                     end
+                                            end
+                                    end, {[], 0}, Orders),
     % mark ids with reserved
-    reserve_action_by(SelecteIds, reserve, FromPid),
+    lists:map(fun(OrderId) -> reserve_action_by(OrderId, reserve, Id) end,
+              SelecteIds),
+    io:format("> ~p reserved order ~p~n", [Id, SelecteIds]),
     { reply, {ok, SelecteIds}, State };
 
 %% load: if the vehicle reserve the order, mark this order's vehicle_id
 %%  conver pid to Id, otherwise the order is unlinked from vehichle
 %% if the vehichle process crashed.
 handle_call({load, OrderId}, FromPid, State) -> 
-    io:format("> Load order id ~p to ~p~n", [OrderId, FromPid]),
+    {Pid, _Ref} = FromPid,
+    Id = get_pid_name(Pid),
     case query_orders(OrderId) of 
         [ ] -> Reply = {error, order_not_exist};
         [O] -> if 
-                   (O#order.reserve_status == reserved) and (O#order.vehicle_id==FromPid) -> 
+                   (O#order.reserve_status == reserved) -> 
+                   % and (O#order.vehicle_id==FromPid) -> 
                        % mark order picked
-                       pick_action_by([OrderId], pick, FromPid),
+                       pick_action_by(OrderId, pick, Id),
                        Reply = ok;
                    true -> Reply = {error, not_reserved}
                end;
         _   -> Reply = {error, unknown}
     end,
+    io:format("> Load order id ~p to ~p~n", [OrderId, Id]),
     { reply, Reply, State };
 
-%%
 %% dropoff: mark order delivered, send {delivered, OrderId} or order owner_pid.
 handle_call({dropoff, OrderId}, FromPid, State) ->
-    io:format("> ~p dropoff order ~p. Send message to owner_pid ~n", [FromPid, OrderId]),
+    {Pid, _Ref} = FromPid,
+    Id = get_pid_name(Pid),
+    io:format("> ~p dropoff order ~p. Send message to owner_pid ~n", [Id, OrderId]),
     case query_orders(OrderId) of 
         [ ]   -> Reply = {error, order_not_exist};
         [O]   -> if 
-                   (O#order.deliver_status == picked) and (O#order.vehicle_id==FromPid) -> 
+                   (O#order.deliver_status == picked) -> 
+                   % and (O#order.vehicle_id==FromPid) -> 
                        % mark order deliverd  
-                       pick_action_by([OrderId], delivered, FromPid),
+                       pick_action_by(OrderId, delivered, Id),
                        % notify order owner
-                       OwnerPid = O#order.owner_pid,
+                       {OwnerPid, _} = O#order.owner_pid,
                        OwnerPid ! {delivered, OrderId},
                        Reply = ok;
                    true -> Reply = {error, not_picked}
@@ -147,7 +157,6 @@ handle_call({dropoff, OrderId}, FromPid, State) ->
     end,
     { reply, Reply, State };
 
-%%
 %% transit: mark unpicked, unreserved. Check if {Loc} is a hub from planner service
 handle_call({transit, OrderId, Loc}, FromPid, State) -> 
     io:format("> ~p transit order ~p at ~p~n", [FromPid, OrderId, Loc]),
@@ -157,12 +166,11 @@ handle_call({transit, OrderId, Loc}, FromPid, State) ->
             case is_order_exist(OrderId) of 
                 false -> { reply, {error, order_not_exist}, State };
                 true  -> 
-                    transit_order([OrderId]),
+                    transit_order(OrderId),
                     { reply, ok, State }
             end
     end;
 
-%% 
 %% lookup: get general order info
 handle_call({lookup, OrderId}, _From, State) ->
     io:format("> ~p check order ~p info.~n", [_From, OrderId]),
@@ -212,8 +220,8 @@ init(Args) ->
         
 % @doc check if {Loc} is a hub by calling planner service
 is_hub(Loc, PlannerService) -> 
-    % TODO: 
-    true.
+    {ok, Hubs} = PlannerService:hub_list(),
+    lists:member(Loc, Hubs).
 
 % @doc build order record
 build_order(OrderId, From, To, Location, Kg, OwnerPid, 
@@ -278,51 +286,60 @@ query_orders(OrderId) ->
     do(qlc:q([ X || X <- mnesia:table(order), X#order.order_id =:= OrderId ])).
     
 % @doc reserved order ids, assume order id exists
-reserve_action_by(OrderIds, Action, By) -> 
+reserve_action_by(OrderId, Action, By) -> 
     F = fun() -> 
-                lists:foreach(fun(OrderId) -> 
-                                      [ O ] = mnesia:read({order, OrderId}),
-                                      case Action of 
-                                          reserve -> 
-                                              N = O#order{reserve_status=reserved, vehicle_id=By},
-                                              mnesia:write(N);
-                                          unreserve -> 
-                                              N = O#order{reserve_status=unreserved, vehicle_id=none},
-                                              mnesia:write(N)
-                                      end
-                              end, OrderIds)
+                [ O ] = mnesia:read({order, OrderId}),
+                case Action of 
+                    reserve -> 
+                        N = O#order{reserve_status=reserved, vehicle_id=By},
+                        mnesia:write(N);
+                    unreserve -> 
+                        N = O#order{reserve_status=not_reserved, vehicle_id=none},
+                        mnesia:write(N)
+                end
         end,
     mnesia:transaction(F).
 
 % @doc pick/deliver order ids, assume order id exists
-pick_action_by(OrderIds, Action, By) -> 
+pick_action_by(OrderId, Action, By) -> 
     F = fun() -> 
-                lists:foreach(fun(OrderId) -> 
-                                      [ O ] = mnesia:read({order, OrderId}),
-                                      case Action of 
-                                          pick -> 
-                                              N = O#order{deliver_status=picked, vehicle_id=By},
-                                              mnesia:write(N);
-                                          unpick -> 
-                                              N = O#order{deliver_status=unpicked, vehicle_id=none},
-                                              mnesia:write(N);
-                                          delivered -> 
-                                              N = O#order{deliver_status=delivered, vehicle_id=By},
-                                              mnesia:write(N)
-                                      end
-                              end, OrderIds)
+                [ O ] = mnesia:read({order, OrderId}),
+                case Action of 
+                    pick -> 
+                        N = O#order{deliver_status=picked, vehicle_id=By},
+                        mnesia:write(N);
+                    unpick -> 
+                        N = O#order{deliver_status=no_picked, vehicle_id=none},
+                        mnesia:write(N);
+                    delivered -> 
+                        N = O#order{deliver_status=delivered, vehicle_id=By},
+                        mnesia:write(N)
+                end
         end,
     mnesia:transaction(F).
 
 % @doc transit order 
-transit_order(OrderIds) -> 
+transit_order(OrderId) -> 
     F = fun() -> 
-                lists:foreach(fun(OrderId) -> 
-                                      [ O ] = mnesia:read({order, OrderId}),
-                                      N = O#order{deliver_status=undelived, 
-                                                  reserve_status=unreserved, 
-                                                  vehicle_id=none},
-                                      mnesia:write(N)
-                              end, OrderIds)
+                [ O ] = mnesia:read({order, OrderId}),
+                N = O#order{deliver_status=undelived, 
+                            reserve_status=unreserved, 
+                            vehicle_id=none},
+                mnesia:write(N)
         end,
     mnesia:transaction(F).
+
+start_in_shell_for_testing() ->
+    mnesia:start(),
+    mnesia:wait_for_tables([order, vehicle], 20000),
+    State = build_init_state(),
+    {ok, _Pid} = gen_server:start_link({local, ?SERVER}, ?MODULE, [State], []),
+    unlink(_Pid),
+    {ok, _Pid}.
+
+% @doc given a pid, get registered_name if exist, undefined otherwise.
+get_pid_name(Pid) -> 
+    case process_info(Pid) of 
+        [{registered_name, Id}|_] -> Id;
+        _ -> undefined
+    end.

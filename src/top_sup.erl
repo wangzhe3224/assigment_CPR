@@ -1,6 +1,7 @@
 -module(top_sup).
 -behaviour(supervisor).
 -export([start_link/1, init/1]).
+-export([start_in_shell_for_testinglink/1]).
 
 start_link(Args) -> 
     supervisor:start_link({local, ?MODULE}, ?MODULE, Args).
@@ -27,3 +28,7 @@ init(FileName) ->
        ]
     }}.
 
+start_in_shell_for_testinglink(Args) -> 
+    {ok, Pid} = supervisor:start_link({local, ?MODULE}, ?MODULE, Args),
+    unlink(Pid),
+    {ok, Pid}.

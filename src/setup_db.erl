@@ -1,16 +1,17 @@
 -module(setup_db).
--export([start/0, do_this_once/0, reset_tables/0, do/1]).
+-export([start/0, setup_db/0, reset_tables/0, clear_tables/0, do/1]).
 -record(vehicle, {
           id, type, capacity, speed, % 100 unit/second
           location, loaded_weight, order_ids,
-          from=none, to=none, distance_to_destination=none
+          from=none, to=none, distance_to_destination=none,
+          process_pid
          }).
 -record(order, {
           order_id, from, to, location, weight,
           owner_pid, reserve_status, deliver_status, vehicle_id, timestamp
          }).
 
-do_this_once() ->
+setup_db() ->
     mnesia:create_schema([node()]),
     mnesia:start(),
     mnesia:create_table(order,     [{attributes, record_info(fields, order)}, {disc_copies, [node()]}]),
@@ -28,6 +29,11 @@ reset_tables() ->
 		lists:foreach(fun mnesia:write/1, gen_test_orders())
 	end,
     mnesia:transaction(F).
+
+clear_tables() -> 
+    mnesia:clear_table(order),
+    mnesia:clear_table(vehicle),
+    cleared_tables.
 
 do(Q) ->
     F = fun() -> qlc:e(Q) end,
