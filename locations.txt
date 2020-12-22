@@ -1,0 +1,19 @@
+{towns, [{"Oxford", 50},
+         {"Manchester", 358},
+         {"Birmingham", 38},
+         {"Leeds", 219},
+         {"Sheffield", 187},
+         {"Liverpool", 198},
+         {"Bristol", 76},
+         {"London", 924}]}.
+{distances, [{"Oxford", "Leeds", 103},
+             {"Oxford", "Sheffield", 345},
+             {"Leeds", "Sheffield", 76},
+             {"Leeds", "Manchester", 121},
+             {"Manchester", "Birmingham", 433},
+             {"Manchester", "Liverpool", 68},
+             {"Liverpool", "Bristol", 118},
+             {"Birmingham", "London", 324}]}.
+{hub, ["Oxford", "Birmingham"]}.
+{van, ["Manchester","Leeds"]}.
+{truck,  ["Manchester","Oxford","Bristol","London"]}.
